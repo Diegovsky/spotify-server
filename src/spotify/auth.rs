@@ -1,326 +1,147 @@
-//! Provides a Spotify access token using the OAuth authorization code flow
-//! with PKCE.
-//!
-//! Assuming sufficient scopes, the returned access token may be used with Spotify's
-//! Web API, and/or to establish a new Session with [`librespot_core`].
-//!
-//! The authorization code flow is an interactive process which requires a web browser
-//! to complete. The resulting code must then be provided back from the browser to this
-//! library for exchange into an access token. Providing the code can be automatic via
-//! a spawned http server (mimicking Spotify's client), or manually via stdin. The latter
-//! is appropriate for headless systems.
-
-use oauth2::url::Url;
-use oauth2::{
-    AuthUrl, AuthorizationCode, ClientId, CsrfToken, PkceCodeChallenge, RedirectUrl, Scope,
-    TokenResponse, TokenUrl, basic::BasicClient,
-};
-use oauth2::{EndpointSet, PkceCodeVerifier, RefreshToken, RequestTokenError};
-use std::collections::HashMap;
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use rand::{RngExt, distr::Alphanumeric};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::io;
 use std::net::SocketAddr;
 use std::time::{Duration, SystemTime};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use thiserror::Error;
 
+mod server_handler;
+
+// --- Configuration Constants ---
 pub const CLIENT_ID: &str = "782ae96ea60f4cdf986a766049607005";
-pub const REDIRECT_URI: &str = "http://127.0.0.1:8898/login";
-pub const SCOPES: &str = "user-read-private,\
-playlist-read-private,\
-playlist-read-collaborative,\
-user-library-read,\
-user-library-modify,\
-user-top-read,\
-user-read-recently-played,\
-user-read-playback-state,\
-playlist-modify-public,\
-playlist-modify-private,\
-user-modify-playback-state,\
-streaming,\
-playlist-modify-public";
+pub const REDIRECT_HOST: &str = "127.0.0.1:8898";
+pub const AUTH_ENDPOINT: &str = "https://accounts.spotify.com/authorize";
+pub const TOKEN_ENDPOINT: &str = "https://accounts.spotify.com/api/token";
+pub const SCOPES: &str = "user-read-private,playlist-read-private,playlist-read-collaborative,user-library-read,user-library-modify,user-top-read,user-read-recently-played,user-read-playback-state,playlist-modify-public,playlist-modify-private,user-modify-playback-state,streaming,playlist-modify-public";
 
-#[derive(Clone)]
-pub struct Credentials {
+// --- Data Structures ---
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Tokens {
+    pub access_token: String,
+    pub refresh_token: String,
+    pub token_expiry_time: SystemTime,
+}
+
+#[derive(Deserialize, Debug)]
+struct SpotifyTokenResponse {
     access_token: String,
-    refresh_token: String,
-    token_expiry_time: SystemTime,
-}
-async fn get_session() -> Result<Credentials, OAuthError> {
-    let auth_url =
-        AuthUrl::new("https://accounts.spotify.com/authorize".to_string()).expect("Malformed URL");
-    let token_url =
-        TokenUrl::new("https://accounts.spotify.com/api/token".to_string()).expect("Malformed URL");
-    let redirect_url = RedirectUrl::new(REDIRECT_URI.to_string()).expect("Malformed URL");
-    let client = BasicClient::new(ClientId::new(CLIENT_ID.to_string()))
-        .set_redirect_uri(redirect_url)
-        .set_token_uri(token_url)
-        .set_auth_uri(auth_url);
-    let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
-
-    // Generate the full authorization URL.
-    // Some of these scopes are unavailable for custom client IDs. Which?
-    let request_scopes: Vec<oauth2::Scope> =
-        SCOPES.split(",").map(|s| Scope::new(s.into())).collect();
-
-    let (auth_url, csrf_token) = client
-        .authorize_url(CsrfToken::new_random)
-        .add_scopes(request_scopes)
-        .set_pkce_challenge(pkce_challenge)
-        .url();
-
-    let result = wait_for_authcode(csrf_token).await.unwrap();
-
-    client
-        .exchange_code(code)
-        .set_pkce_verifier(challenge.pkce_verifier)
-        .request_async(async_http_client)
-        .await
-        .map_err(|e| match e {
-            RequestTokenError::ServerResponse(res) => {
-                error!(
-                    "An error occured while exchange a code: {}",
-                    res.to_string()
-                );
-                OAuthError::ExchangeCode { e: res.to_string() }
-            }
-            e => OAuthError::ExchangeCode { e: e.to_string() },
-        })?;
-
-    trace!("Obtained new access token: {token:?}");
-
-    let refresh_token = token
-        .refresh_token()
-        .ok_or(OAuthError::NoRefreshToken)?
-        .secret()
-        .to_string();
-
-    let token = Credentials {
-        access_token: token.access_token().secret().to_string(),
-        refresh_token,
-        token_expiry_time: 
-            SystemTime::now()
-                + token
-                    .expires_in()
-                    .unwrap_or_else(|| Duration::from_secs(3600)),
-        ,
-    };
-
-    Ok(token)
-}
-
-pub async fn refresh_token(&self, old_token: Credentials) -> Result<Credentials, OAuthError> {
-    let Ok(token) = self
-        .client
-        .exchange_refresh_token(&RefreshToken::new(old_token.refresh_token))
-        .request_async(async_http_client)
-        .await
-        .inspect_err(|e| {
-            if let RequestTokenError::ServerResponse(res) = e {
-                error!(
-                    "An error occured while refreshing the token: {}",
-                    res.to_string()
-                );
-            }
-        })
-    else {
-        self.token_store.clear().await;
-        return Err(OAuthError::NoRefreshToken);
-    };
-
-    let refresh_token = token
-        .refresh_token()
-        .ok_or(OAuthError::NoRefreshToken)?
-        .secret()
-        .to_string();
-
-    let new_token = Credentials {
-        access_token: token.access_token().secret().to_string(),
-        refresh_token,
-        token_expiry_time: Some(
-            SystemTime::now()
-                + token
-                    .expires_in()
-                    .unwrap_or_else(|| Duration::from_secs(3600)),
-        ),
-    };
-
-    self.token_store.set(new_token.clone()).await;
-    Ok(new_token)
-}
-
-pub async fn refresh_token_at_expiry(&self) -> Result<Credentials, OAuthError> {
-    let Some(old_token) = self.token_store.get_cached().await.take() else {
-        return Err(OAuthError::NoRefreshToken);
-    };
-
-    let duration = old_token
-        .token_expiry_time
-        .and_then(|d| d.duration_since(SystemTime::now()).ok())
-        .unwrap_or(Duration::from_secs(120));
-
-    info!(
-        "Refreshing token in approx {}min",
-        duration.as_secs().div_euclid(60)
-    );
-    tokio::time::sleep(duration.saturating_sub(Duration::from_secs(10))).await;
-
-    info!("Refreshing token...");
-    self.refresh_token(old_token).await
+    refresh_token: Option<String>,
+    expires_in: u64,
 }
 
 #[derive(Debug, Error)]
 pub enum OAuthError {
     #[error("Auth code param not found in URI")]
     AuthCodeNotFound,
-
     #[error("CSRF token param not found in URI")]
     CsrfTokenNotFound,
-
     #[error("Failed to bind server to {addr} ({e})")]
     AuthCodeListenerBind { addr: SocketAddr, e: io::Error },
-
-    #[error("Listener terminated without accepting a connection")]
-    AuthCodeListenerTerminated,
-
-    #[error("Failed to parse redirect URI from HTTP request")]
-    AuthCodeListenerParse,
-
-    #[error("Failed to write HTTP response")]
-    AuthCodeListenerWrite,
-
-    #[error("Failed to exchange code for access token ({e})")]
-    ExchangeCode { e: String },
-
-    #[error("Spotify did not provide a refresh token")]
+    #[error("Request error: {0}")]
+    RequestError(#[from] reqwest::Error),
+    #[error("No refresh token provided")]
     NoRefreshToken,
-
-    #[error("No saved token")]
-    LoggedOut,
-
-    #[error("Mismatched state during auth code exchange")]
+    #[error("Mismatched state (CSRF)")]
     InvalidState,
 }
-
-/// Spawn HTTP server at provided socket address to accept OAuth callback and return auth code.
-async fn wait_for_authcode(expected_state: CsrfToken) -> Result<AuthorizationCode, OAuthError> {
-    let addr = get_socket_address(REDIRECT_URI).expect("Invalid redirect uri");
-
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .map_err(|e| OAuthError::AuthCodeListenerBind { addr, e })?;
-
-    let (mut stream, _) = listener
-        .accept()
-        .await
-        .map_err(|_| OAuthError::AuthCodeListenerTerminated)?;
-
-    let mut request_line = String::new();
-    let mut reader = BufReader::new(&mut stream);
-    reader
-        .read_line(&mut request_line)
-        .await
-        .map_err(|_| OAuthError::AuthCodeListenerParse)?;
-
-    let (state, code) = parse_query(&request_line)?;
-    if *expected_state.secret() != *state.secret() {
-        return Err(OAuthError::InvalidState);
-    }
-
-    let message = include_str!("./login.html");
-    let response = format!(
-        "HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n{}",
-        message.len(),
-        message
-    );
-    stream
-        .write_all(response.as_bytes())
-        .await
-        .map_err(|_| OAuthError::AuthCodeListenerWrite)?;
-
-    Ok(code)
+pub struct Authenticator {
+    client: reqwest::Client,
 }
 
-fn parse_query(request_line: &str) -> Result<(CsrfToken, AuthorizationCode), OAuthError> {
-    let query = request_line
-        .split_whitespace()
-        .nth(1)
-        .ok_or(OAuthError::AuthCodeListenerParse)?
-        .split("?")
-        .nth(1)
-        .ok_or(OAuthError::AuthCodeListenerParse)?;
-
-    let mut query_params: HashMap<String, String> = url::form_urlencoded::parse(query.as_bytes())
-        .into_owned()
-        .collect();
-
-    let csrf_token = query_params
-        .remove("state")
-        .map(CsrfToken::new)
-        .ok_or(OAuthError::CsrfTokenNotFound)?;
-    let code = query_params
-        .remove("code")
-        .map(AuthorizationCode::new)
-        .ok_or(OAuthError::AuthCodeNotFound)?;
-
-    Ok((csrf_token, code))
-}
-
-// If the specified `redirect_uri` is HTTP, loopback, and contains a port,
-// then the corresponding socket address is returned.
-fn get_socket_address(redirect_uri: &str) -> Option<SocketAddr> {
-    let url = match Url::parse(redirect_uri) {
-        Ok(u) if u.scheme() == "http" && u.port().is_some() => u,
-        _ => return None,
-    };
-    let socket_addr = match url.socket_addrs(|| None) {
-        Ok(mut addrs) => addrs.pop(),
-        _ => None,
-    };
-    if let Some(s) = socket_addr {
-        if s.ip().is_loopback() {
-            return socket_addr;
+impl Authenticator {
+    pub fn new() -> Self {
+        Self {
+            client: reqwest::Client::new(),
         }
     }
-    None
+
+    pub async fn authenticate(&self) -> Result<Tokens, OAuthError> {
+        let (verifier, challenge) = generate_pkce();
+        let state: String = rand_alphanum(22);
+
+        let redirect_url = format!("http://{REDIRECT_HOST}/login");
+
+        let auth_url = format!(
+            "{}?client_id={}&response_type=code&redirect_uri={}&code_challenge_method=S256&code_challenge={}&state={}&scope={}",
+            AUTH_ENDPOINT,
+            CLIENT_ID,
+            urlencoding::encode(&redirect_url),
+            challenge,
+            state,
+            urlencoding::encode(SCOPES).replace("%2C", "%20")
+        );
+        println!("Open this URL in your browser:\n\n{}\n", auth_url);
+
+        // 1. Wait for the redirect callback
+        let code = self.wait_for_authcode(state).await?;
+
+        // 2. Exchange code for tokens
+        let params = [
+            ("client_id", CLIENT_ID),
+            ("grant_type", "authorization_code"),
+            ("code", &code),
+            ("redirect_uri", &redirect_url),
+            ("code_verifier", &verifier),
+        ];
+
+        let res = self
+            .client
+            .post(TOKEN_ENDPOINT)
+            .form(&params)
+            .send()
+            .await?;
+
+        let data: SpotifyTokenResponse = res.json().await?;
+
+        Ok(Tokens {
+            access_token: data.access_token,
+            refresh_token: data.refresh_token.ok_or(OAuthError::NoRefreshToken)?,
+            token_expiry_time: SystemTime::now() + Duration::from_secs(data.expires_in),
+        })
+    }
+
+    pub async fn refresh_token(&self, old: &Tokens) -> Result<Tokens, OAuthError> {
+        let params = [
+            ("client_id", CLIENT_ID),
+            ("grant_type", "refresh_token"),
+            ("refresh_token", &old.refresh_token),
+        ];
+
+        let res = self
+            .client
+            .post(TOKEN_ENDPOINT)
+            .form(&params)
+            .send()
+            .await?;
+        let data: SpotifyTokenResponse = res.json().await?;
+
+        Ok(Tokens {
+            access_token: data.access_token,
+            refresh_token: data
+                .refresh_token
+                .unwrap_or_else(|| old.refresh_token.clone()),
+            token_expiry_time: SystemTime::now() + Duration::from_secs(data.expires_in),
+        })
+    }
 }
 
-#[cfg(test)]
-mod test {
-    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+fn rand_alphanum(len: usize) -> String {
+    rand::rng()
+        .sample_iter(&Alphanumeric)
+        .take(len)
+        .map(char::from)
+        .collect()
+}
 
-    use super::*;
+fn generate_pkce() -> (String, String) {
+    let verifier = rand_alphanum(64);
 
-    #[test]
-    fn get_socket_address_none() {
-        // No port
-        assert_eq!(get_socket_address("http://127.0.0.1/foo"), None);
-        assert_eq!(get_socket_address("http://127.0.0.1:/foo"), None);
-        assert_eq!(get_socket_address("http://[::1]/foo"), None);
-        // Not localhost
-        assert_eq!(get_socket_address("http://56.0.0.1:1234/foo"), None);
-        assert_eq!(
-            get_socket_address("http://[3ffe:2a00:100:7031::1]:1234/foo"),
-            None
-        );
-        // Not http
-        assert_eq!(get_socket_address("https://127.0.0.1/foo"), None);
-    }
+    let mut hasher = Sha256::new();
+    hasher.update(verifier.as_bytes());
+    let challenge = URL_SAFE_NO_PAD.encode(hasher.finalize());
 
-    #[test]
-    fn get_socket_address_localhost() {
-        let localhost_v4 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 1234);
-        let localhost_v6 = SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1)), 8888);
-
-        assert_eq!(
-            get_socket_address("http://127.0.0.1:1234/foo"),
-            Some(localhost_v4)
-        );
-        assert_eq!(
-            get_socket_address("http://[0:0:0:0:0:0:0:1]:8888/foo"),
-            Some(localhost_v6)
-        );
-        assert_eq!(
-            get_socket_address("http://[::1]:8888/foo"),
-            Some(localhost_v6)
-        );
-    }
+    (verifier, challenge)
 }
