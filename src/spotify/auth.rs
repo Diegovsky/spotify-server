@@ -1,147 +1,82 @@
-use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-use rand::{RngExt, distr::Alphanumeric};
-use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
-use std::io;
-use std::net::SocketAddr;
-use std::time::{Duration, SystemTime};
-use thiserror::Error;
+use rspotify::{
+    AuthCodePkceSpotify, AuthCodeSpotify, Credentials, Token,
+    prelude::{BaseClient, OAuthClient},
+};
 
-mod server_handler;
+use crate::Result;
 
-// --- Configuration Constants ---
-pub const CLIENT_ID: &str = "782ae96ea60f4cdf986a766049607005";
-pub const REDIRECT_HOST: &str = "127.0.0.1:8898";
-pub const AUTH_ENDPOINT: &str = "https://accounts.spotify.com/authorize";
-pub const TOKEN_ENDPOINT: &str = "https://accounts.spotify.com/api/token";
+pub struct AuthManager {
+    client: AuthCodePkceSpotify,
+}
+
+pub const CLIENT_ID: &str = "69ae761c99634e4395fb20ae42104971";
+pub const REDIRECT_URL: &str = "http://127.0.0.1:8891/login";
 pub const SCOPES: &str = "user-read-private,playlist-read-private,playlist-read-collaborative,user-library-read,user-library-modify,user-top-read,user-read-recently-played,user-read-playback-state,playlist-modify-public,playlist-modify-private,user-modify-playback-state,streaming,playlist-modify-public";
 
-// --- Data Structures ---
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct Tokens {
-    pub access_token: String,
-    pub refresh_token: String,
-    pub token_expiry_time: SystemTime,
-}
-
-#[derive(Deserialize, Debug)]
-struct SpotifyTokenResponse {
-    access_token: String,
-    refresh_token: Option<String>,
-    expires_in: u64,
-}
-
-#[derive(Debug, Error)]
-pub enum OAuthError {
-    #[error("Auth code param not found in URI")]
-    AuthCodeNotFound,
-    #[error("CSRF token param not found in URI")]
-    CsrfTokenNotFound,
-    #[error("Failed to bind server to {addr} ({e})")]
-    AuthCodeListenerBind { addr: SocketAddr, e: io::Error },
-    #[error("Request error: {0}")]
-    RequestError(#[from] reqwest::Error),
-    #[error("No refresh token provided")]
-    NoRefreshToken,
-    #[error("Mismatched state (CSRF)")]
-    InvalidState,
-}
-pub struct Authenticator {
-    client: reqwest::Client,
-}
-
-impl Authenticator {
+impl AuthManager {
     pub fn new() -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: AuthCodePkceSpotify::with_config(
+                Credentials::new_pkce(CLIENT_ID),
+                rspotify::OAuth {
+                    redirect_uri: REDIRECT_URL.into(),
+                    state: "".into(),
+                    scopes: SCOPES.split(",").map(ToOwned::to_owned).collect(),
+                    proxies: None,
+                },
+                rspotify::Config {
+                    token_cached: true,
+                    ..Default::default()
+                },
+            ),
         }
     }
+    pub async fn authenticate(&mut self) -> Result<Token> {
+        let url = &*self.client.get_authorize_url(None)?;
+        let client = &mut self.client;
 
-    pub async fn authenticate(&self) -> Result<Tokens, OAuthError> {
-        let (verifier, challenge) = generate_pkce();
-        let state: String = rand_alphanum(22);
+        match self.client.read_token_cache(true).await {
+            Ok(Some(new_token)) => {
+                let expired = new_token.is_expired();
 
-        let redirect_url = format!("http://{REDIRECT_HOST}/login");
+                // Load token into client regardless of whether it's expired o
+                // not, since it will be refreshed later anyway.
+                *self.client.get_token().lock().await.unwrap() = Some(new_token);
 
-        let auth_url = format!(
-            "{}?client_id={}&response_type=code&redirect_uri={}&code_challenge_method=S256&code_challenge={}&state={}&scope={}",
-            AUTH_ENDPOINT,
-            CLIENT_ID,
-            urlencoding::encode(&redirect_url),
-            challenge,
-            state,
-            urlencoding::encode(SCOPES).replace("%2C", "%20")
-        );
-        println!("Open this URL in your browser:\n\n{}\n", auth_url);
+                if expired {
+                    // Ensure that we actually got a token from the refetch
+                    match self.client.refetch_token().await {
+                        Ok(Some(refreshed_token)) => {
+                            println!("Successfully refreshed expired token from token cache");
+                            *self.client.get_token().lock().await.unwrap() = Some(refreshed_token)
+                        }
+                        // If not, prompt the user for it
+                        Ok(None) => {
+                            println!("Unable to refresh expired token from token cache");
+                            let code = self.client.get_code_from_user(url)?;
+                            self.client.request_token(&code).await?;
+                        }
+                        Err(err) => {
+                            println!("Error refetching token: {err}. Falling back to user prompt.");
+                            // If the cached token contains invalid data, we want to re-login
+                            let code = self.client.get_code_from_user(url)?;
+                            self.client.request_token(&code).await?;
+                        }
+                    }
+                }
+            }
+            // Otherwise following the usual procedure to get the token.
+            _ => {
+                println!("Open:\n{url}");
+                let code = self
+                    .client
+                    .get_authcode_listener(self.client.get_socket_address(REDIRECT_URL).unwrap())?;
+                self.client.request_token(&code).await?;
+            }
+        }
 
-        // 1. Wait for the redirect callback
-        let code = self.wait_for_authcode(state).await?;
-
-        // 2. Exchange code for tokens
-        let params = [
-            ("client_id", CLIENT_ID),
-            ("grant_type", "authorization_code"),
-            ("code", &code),
-            ("redirect_uri", &redirect_url),
-            ("code_verifier", &verifier),
-        ];
-
-        let res = self
-            .client
-            .post(TOKEN_ENDPOINT)
-            .form(&params)
-            .send()
-            .await?;
-
-        let data: SpotifyTokenResponse = res.json().await?;
-
-        Ok(Tokens {
-            access_token: data.access_token,
-            refresh_token: data.refresh_token.ok_or(OAuthError::NoRefreshToken)?,
-            token_expiry_time: SystemTime::now() + Duration::from_secs(data.expires_in),
-        })
+        self.client.write_token_cache().await?;
+        let token = self.client.token.lock().await.unwrap().clone().unwrap();
+        Ok(token)
     }
-
-    pub async fn refresh_token(&self, old: &Tokens) -> Result<Tokens, OAuthError> {
-        let params = [
-            ("client_id", CLIENT_ID),
-            ("grant_type", "refresh_token"),
-            ("refresh_token", &old.refresh_token),
-        ];
-
-        let res = self
-            .client
-            .post(TOKEN_ENDPOINT)
-            .form(&params)
-            .send()
-            .await?;
-        let data: SpotifyTokenResponse = res.json().await?;
-
-        Ok(Tokens {
-            access_token: data.access_token,
-            refresh_token: data
-                .refresh_token
-                .unwrap_or_else(|| old.refresh_token.clone()),
-            token_expiry_time: SystemTime::now() + Duration::from_secs(data.expires_in),
-        })
-    }
-}
-
-fn rand_alphanum(len: usize) -> String {
-    rand::rng()
-        .sample_iter(&Alphanumeric)
-        .take(len)
-        .map(char::from)
-        .collect()
-}
-
-fn generate_pkce() -> (String, String) {
-    let verifier = rand_alphanum(64);
-
-    let mut hasher = Sha256::new();
-    hasher.update(verifier.as_bytes());
-    let challenge = URL_SAFE_NO_PAD.encode(hasher.finalize());
-
-    (verifier, challenge)
 }
