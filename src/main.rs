@@ -1,63 +1,64 @@
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 
 use axum::{
     Router,
-    extract::{Path, State},
-    routing::post,
+    routing::{get, post},
 };
-use librespot::{
-    core::{Session, SessionConfig, SpotifyId, SpotifyUri},
-    discovery::Credentials,
-    playback::{
-        audio_backend,
-        config::{AudioFormat, PlayerConfig, VolumeCtrl},
-        mixer::{Mixer as _, MixerConfig, NoOpVolume, softmixer::SoftMixer},
-        player::Player,
-    },
-};
+use futures::channel::mpsc::{Receiver, channel};
 pub type Result<T = ()> = anyhow::Result<T>;
 
-use crate::spotify::{AuthManager, Settings, SpotifyManager};
+use crate::spotify::{Settings, SpotifyManager, SpotifyManagerArc};
 
+mod control;
+mod error;
+mod list;
 mod spotify;
 
-async fn control(State(app): State<App>, Path(action): Path<String>) {
-    println!("Action: {action}");
+#[derive(Clone, Debug)]
+enum PlaybackMessage {
+    Stopped,
+    Started,
+    Paused,
+    TrackChanged,
+    Loading,
+    TrackEnded,
+    Unavailable,
+}
+
+#[derive(Clone, Debug)]
+enum PlayerMessage {
+    PlaybackMessage(PlaybackMessage),
 }
 
 type App = Arc<AppState>;
+
 struct AppState {
-    spotify: SpotifyManager,
+    spotify: SpotifyManagerArc,
+    pending_messages: Receiver<PlayerMessage>,
 }
 
 #[tokio::main]
 async fn main() {
-    let track_id = SpotifyUri::from_uri("spotify:track:3iyagZIYPdmiXQQI3Ig36j").unwrap();
-    let spotify = SpotifyManager::new(Settings::new()).await.unwrap();
+    let (tx, rx) = channel::<PlayerMessage>(12);
+    let spotify = SpotifyManager::new(tx.clone(), Settings::new())
+        .await
+        .unwrap();
 
-    spotify.player.load(track_id, true, 0);
-    spotify
-        .player
-        .set_sink_event_callback(Some(Box::new(|ev| println!("Sink status: {ev:?}"))));
-    let mut ch = spotify.player.get_player_event_channel();
-    while let Some(ev) = ch.recv().await {
-        println!("Player event: {ev:?}");
-        if matches!(
-            ev,
-            librespot::playback::player::PlayerEvent::Stopped { .. }
-                | librespot::playback::player::PlayerEvent::Unavailable { .. }
-        ) {
-            break;
-        }
-    }
-    // return;
+    let app_state = AppState {
+        spotify,
+        pending_messages: rx,
+    };
+    println!("Username: {}", app_state.spotify.session.username());
+    let app_state = Arc::new(app_state);
+    let app = Router::new()
+        .route("/control/play", post(control::play))
+        .route("/list/playlists/", get(list::list))
+        .route("/list/playlists/{id}", get(list::list))
+        .with_state(app_state);
 
-    // let app_state = AppState {};
-    // let app_state = Arc::new(app_state);
-    // let app = Router::new()
-    //     .route("/control/{action}", post(control))
-    //     .with_state(app_state);
+    let ip = "0.0.0.0:8080";
+    let listener = tokio::net::TcpListener::bind(ip).await.unwrap();
 
-    // let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await.unwrap();
-    // axum::serve(listener, app).await.unwrap();
+    println!("Listening on {ip}");
+    axum::serve(listener, app).await.unwrap();
 }

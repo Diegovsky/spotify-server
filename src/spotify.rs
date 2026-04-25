@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 pub use auth::AuthManager;
+use futures::{SinkExt, channel::mpsc::Sender};
 use librespot::{
     core::{Session, SessionConfig},
     discovery::Credentials,
@@ -8,12 +9,13 @@ use librespot::{
         audio_backend,
         config::{AudioFormat, PlayerConfig},
         mixer::NoOpVolume,
-        player::Player,
+        player::{Player, PlayerEvent},
     },
 };
 use rspotify::AuthCodeSpotify;
+use tokio::sync::mpsc::UnboundedReceiver;
 
-use crate::Result;
+use crate::{PlaybackMessage, PlayerMessage, Result};
 
 mod auth;
 
@@ -35,16 +37,19 @@ impl Settings {
     }
 }
 
+pub type SpotifyManagerArc = Arc<SpotifyManager>;
+
 pub struct SpotifyManager {
     pub auth: AuthManager,
     pub settings: Settings,
     pub session: Session,
     pub api: AuthCodeSpotify,
     pub player: Arc<Player>,
+    channel: Sender<PlayerMessage>,
 }
 
 impl SpotifyManager {
-    pub async fn new(settings: Settings) -> Result<Self> {
+    pub async fn new(channel: Sender<PlayerMessage>, settings: Settings) -> Result<Arc<Self>> {
         let mut auth = AuthManager::new();
         let token = auth.authenticate().await?;
         let credentials = Credentials::with_access_token(&token.access_token);
@@ -60,13 +65,42 @@ impl SpotifyManager {
                 backend(None, AudioFormat::default())
             },
         );
-
-        Ok(Self {
+        let tx = player.get_player_event_channel();
+        let this = Arc::new(Self {
             api: AuthCodeSpotify::from_token(token),
             session,
             player,
             settings,
             auth,
-        })
+            channel,
+        });
+        tokio::spawn(this.clone().player_message_handler(tx));
+
+        Ok(this)
+    }
+
+    async fn player_message_handler(
+        self: Arc<Self>,
+        mut spotify_ch: UnboundedReceiver<PlayerEvent>,
+    ) {
+        let mut tx = self.channel.clone();
+        while let Some(event) = spotify_ch.recv().await {
+            eprintln!("event: {event:#?}");
+
+            let msg = match event {
+                PlayerEvent::Stopped { .. } => PlaybackMessage::Stopped,
+                PlayerEvent::Loading { .. } => PlaybackMessage::Loading,
+                PlayerEvent::Playing { .. } => PlaybackMessage::Started,
+                PlayerEvent::Paused { .. } => PlaybackMessage::Paused,
+                PlayerEvent::EndOfTrack { .. } => PlaybackMessage::TrackEnded,
+                PlayerEvent::Unavailable { .. } => PlaybackMessage::Unavailable,
+                PlayerEvent::TrackChanged { .. } => PlaybackMessage::TrackChanged,
+
+                _ => {
+                    continue;
+                }
+            };
+            tx.send(PlayerMessage::PlaybackMessage(msg)).await.unwrap();
+        }
     }
 }
