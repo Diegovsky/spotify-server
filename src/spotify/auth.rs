@@ -20,9 +20,8 @@ impl AuthManager {
                 Credentials::new_pkce(CLIENT_ID),
                 rspotify::OAuth {
                     redirect_uri: REDIRECT_URL.into(),
-                    state: "".into(),
                     scopes: SCOPES.split(",").map(ToOwned::to_owned).collect(),
-                    proxies: None,
+                    ..Default::default()
                 },
                 rspotify::Config {
                     token_cached: true,
@@ -33,7 +32,6 @@ impl AuthManager {
     }
     pub async fn authenticate(&mut self) -> Result<Token> {
         let url = &*self.client.get_authorize_url(None)?;
-        let client = &mut self.client;
 
         match self.client.read_token_cache(true).await {
             Ok(Some(new_token)) => {
