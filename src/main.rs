@@ -52,6 +52,7 @@ async fn main() {
     let app_state = Arc::new(app_state);
     let app = Router::new()
         .route("/control/play", post(control::play))
+        .route("/control/toggle-pause", post(control::toggle_pause))
         .route("/list/playlists/", get(list::list))
         .route("/list/playlists/{id}", get(list::list))
         .with_state(app_state);

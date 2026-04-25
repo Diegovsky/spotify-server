@@ -1,6 +1,7 @@
 use axum::extract::{Path, Query};
 use axum::response::IntoResponse;
 use axum::{Json, extract::State};
+use futures::{StreamExt, TryStreamExt};
 use rspotify::model::PlaylistId;
 use rspotify::prelude::{BaseClient, OAuthClient};
 
@@ -18,7 +19,8 @@ pub async fn list(State(app): State<App>, pid: Option<Path<String>>) -> RouteRes
         Some(Path(pid)) => {
             let pid = PlaylistId::from_id(pid)?;
             let playlist = api
-                .playlist(pid, None, Some(rspotify::model::Market::FromToken))
+                .playlist_items(pid, None, Some(rspotify::model::Market::FromToken))
+                .try_collect::<Vec<_>>()
                 .await?;
             Ok(Json(playlist).into_response())
         }

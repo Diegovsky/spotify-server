@@ -13,7 +13,7 @@ use librespot::{
     },
 };
 use rspotify::AuthCodeSpotify;
-use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::{Mutex, mpsc::UnboundedReceiver};
 
 use crate::{PlaybackMessage, PlayerMessage, Result};
 
@@ -38,6 +38,10 @@ impl Settings {
 }
 
 pub type SpotifyManagerArc = Arc<SpotifyManager>;
+pub struct PlayerState {
+    pub playing: bool,
+    pub paused: bool,
+}
 
 pub struct SpotifyManager {
     pub auth: AuthManager,
@@ -45,6 +49,7 @@ pub struct SpotifyManager {
     pub session: Session,
     pub api: AuthCodeSpotify,
     pub player: Arc<Player>,
+    pub player_state: Mutex<PlayerState>,
     channel: Sender<PlayerMessage>,
 }
 
@@ -67,6 +72,10 @@ impl SpotifyManager {
         );
         let tx = player.get_player_event_channel();
         let this = Arc::new(Self {
+            player_state: Mutex::new(PlayerState {
+                playing: false,
+                paused: false,
+            }),
             api: AuthCodeSpotify::from_token(token),
             session,
             player,
@@ -100,6 +109,24 @@ impl SpotifyManager {
                     continue;
                 }
             };
+            {
+                use PlaybackMessage::*;
+                let mut player = self.player_state.lock().await;
+                match msg {
+                    Stopped | Unavailable | TrackEnded => {
+                        player.playing = false;
+                        player.paused = false;
+                    }
+                    Started | Loading { .. } | TrackChanged => {
+                        player.playing = true;
+                        player.paused = false;
+                    }
+                    Paused => {
+                        player.playing = true;
+                        player.paused = true;
+                    }
+                }
+            }
             tx.send(PlayerMessage::PlaybackMessage(msg)).await.unwrap();
         }
     }

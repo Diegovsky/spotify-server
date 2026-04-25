@@ -25,6 +25,7 @@ impl AuthManager {
                 },
                 rspotify::Config {
                     token_cached: true,
+                    token_refreshing: true,
                     ..Default::default()
                 },
             ),
