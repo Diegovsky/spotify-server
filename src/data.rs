@@ -1,6 +1,4 @@
-use std::any::{Any, TypeId};
-
-use rspotify::model::{self, FullTrack, PlayableItem, PlaylistItem, SimplifiedPlaylist};
+use rspotify::model::{self, FullTrack, PlayableItem, SimplifiedPlaylist};
 use serde::{Deserialize, Serialize};
 
 pub type TrackId = model::PlayableId<'static>;
@@ -15,10 +13,6 @@ pub struct Track {
     pub id: Option<TrackId>,
     pub name: String,
     pub playable: bool,
-}
-
-fn is_null<'a, T: Any>(_: &'a T) -> bool {
-    (TypeId::of::<T>()) == ().type_id()
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

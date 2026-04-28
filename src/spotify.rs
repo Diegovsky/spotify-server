@@ -3,12 +3,13 @@ use std::sync::Arc;
 pub use auth::AuthManager;
 use futures::{SinkExt, channel::mpsc::Sender};
 use librespot::{
+    connect::Spirc,
     core::{Session, SessionConfig},
-    discovery::Credentials,
+    discovery::{Credentials, DeviceType},
     playback::{
         audio_backend,
         config::{AudioFormat, PlayerConfig},
-        mixer::NoOpVolume,
+        mixer::{self, Mixer, NoOpVolume},
         player::{Player, PlayerEvent},
     },
 };
@@ -44,12 +45,18 @@ impl Settings {
 pub type SpotifyManagerArc = Arc<SpotifyManager>;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub enum PlabackState {
+pub enum PlaybackState {
     Playing {
         paused: bool,
     },
     #[default]
     Stopped,
+}
+
+impl PlaybackState {
+    pub fn is_stopped(&self) -> bool {
+        *self == Self::Stopped
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -62,7 +69,7 @@ pub enum Repeat {
 
 #[derive(Clone, Serialize, Deserialize, Default)]
 pub struct PlayerState {
-    pub playback: PlabackState,
+    pub playback: PlaybackState,
     pub shuffled: bool,
     pub sorting: Repeat,
 }
@@ -72,8 +79,10 @@ pub struct SpotifyManager {
     pub settings: Settings,
     pub session: Session,
     pub api: CacheApi,
+    pub mixer: Arc<dyn Mixer>,
     pub player: Arc<Player>,
     pub player_state: Mutex<PlayerState>,
+    pub spirc: Spirc,
     channel: Sender<PlayerMessage>,
 }
 
@@ -85,19 +94,39 @@ impl SpotifyManager {
         let token = auth.authenticate().await?;
         let credentials = Credentials::with_access_token(&token.access_token);
         let session = Session::new(settings.session.clone(), None);
-        session.connect(credentials, true).await?;
+        // session.connect(credentials.clone(), true).await?;
+
+        let mixer = mixer::find(None).unwrap();
+        let mixer = mixer(mixer::MixerConfig::default())?;
 
         let player = Player::new(
             settings.player.clone(),
             session.clone(),
-            Box::new(NoOpVolume),
+            mixer.get_soft_volume(),
             || {
                 let backend = audio_backend::find(None).expect("No audio backend found");
                 backend(None, AudioFormat::default())
             },
         );
         let tx = player.get_player_event_channel();
+
+        let (spirc, task) = Spirc::new(
+            librespot::connect::ConnectConfig {
+                name: "daemon".to_string(),
+                device_type: DeviceType::Computer,
+                ..Default::default()
+            },
+            session.clone(),
+            credentials.clone(),
+            player.clone(),
+            mixer.clone(),
+        )
+        .await
+        .unwrap();
+        tokio::spawn(task);
         let this = Arc::new(Self {
+            mixer,
+            spirc,
             api: CacheApi::new(AuthCodeSpotify::from_token(token), cacher),
             player_state: Mutex::new(PlayerState::default()),
             session,
@@ -136,12 +165,12 @@ impl SpotifyManager {
                 use PlaybackMessage::*;
                 let mut player = self.player_state.lock().await;
                 match msg {
-                    Stopped | Unavailable | TrackEnded => player.playback = PlabackState::Stopped,
+                    Stopped | Unavailable | TrackEnded => player.playback = PlaybackState::Stopped,
                     Started | Loading { .. } | TrackChanged => {
-                        player.playback = PlabackState::Playing { paused: false }
+                        player.playback = PlaybackState::Playing { paused: false }
                     }
 
-                    Paused => player.playback = PlabackState::Playing { paused: true },
+                    Paused => player.playback = PlaybackState::Playing { paused: true },
                 }
             }
             tx.send(PlayerMessage::PlaybackMessage(msg)).await.unwrap();

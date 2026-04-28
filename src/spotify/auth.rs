@@ -1,5 +1,5 @@
 use rspotify::{
-    AuthCodePkceSpotify, AuthCodeSpotify, Credentials, Token,
+    AuthCodePkceSpotify, Credentials, Token,
     prelude::{BaseClient, OAuthClient},
 };
 

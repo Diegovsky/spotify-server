@@ -1,27 +1,19 @@
 use crate::{
     Result,
-    data::{OptFrom as _, PlaylistId, Track},
+    data::{OptFrom as _, PlaylistId, Track, TrackId},
 };
-use std::{
-    any::{Any, TypeId},
-    collections::HashMap,
-    sync::Arc,
-};
+use std::any::Any;
 
-use async_sqlite::{
-    Client, ClientBuilder,
-    rusqlite::{OptionalExtension, Params},
-};
-use futures::{StreamExt as _, TryStreamExt as _, lock::Mutex};
+use async_sqlite::{Client, ClientBuilder, rusqlite::OptionalExtension};
+use futures::{StreamExt as _, TryStreamExt as _};
 use rspotify::{
     AuthCodeSpotify,
     model::{Id, Market},
     prelude::{BaseClient as _, OAuthClient as _},
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use tokio::sync::RwLock;
 
-use crate::{data::PlaylistInfo, spotify::SpotifyManagerArc};
+use crate::data::PlaylistInfo;
 
 #[derive(Serialize, Deserialize)]
 struct CachedEntry {
@@ -140,5 +132,10 @@ impl CacheApi {
                 return Ok(playlists);
             }
         }
+    }
+
+    pub async fn add_to_queue(&self, id: TrackId) -> Result {
+        self.api.add_item_to_queue(id, None).await?;
+        Ok(())
     }
 }

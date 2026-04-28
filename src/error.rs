@@ -49,4 +49,3 @@ macro_rules! bail {
         return Err($crate::error::Error::from(anyhow::anyhow!($($tt)*)))
     };
 }
-pub use bail;
