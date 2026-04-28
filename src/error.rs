@@ -15,18 +15,12 @@ impl std::fmt::Debug for Error {
     }
 }
 
-impl From<Error> for anyhow::Error {
-    fn from(value: Error) -> Self {
-        value.0
-    }
-}
-
 impl<T> From<T> for Error
 where
-    T: std::error::Error + Sync + Send + 'static,
+    T: Into<anyhow::Error>,
 {
     fn from(value: T) -> Self {
-        Self(anyhow::Error::from(value))
+        Self(value.into())
     }
 }
 

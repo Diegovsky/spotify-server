@@ -15,9 +15,13 @@ use librespot::{
 use rspotify::AuthCodeSpotify;
 use tokio::sync::{Mutex, mpsc::UnboundedReceiver};
 
-use crate::{PlaybackMessage, PlayerMessage, Result};
+use crate::{
+    PlaybackMessage, PlayerMessage, Result,
+    spotify::cache::{CacheApi, Cacher},
+};
 
 mod auth;
+mod cache;
 
 pub struct Settings {
     session: SessionConfig,
@@ -47,7 +51,7 @@ pub struct SpotifyManager {
     pub auth: AuthManager,
     pub settings: Settings,
     pub session: Session,
-    pub api: AuthCodeSpotify,
+    pub api: CacheApi,
     pub player: Arc<Player>,
     pub player_state: Mutex<PlayerState>,
     channel: Sender<PlayerMessage>,
@@ -55,6 +59,8 @@ pub struct SpotifyManager {
 
 impl SpotifyManager {
     pub async fn new(channel: Sender<PlayerMessage>, settings: Settings) -> Result<Arc<Self>> {
+        let cacher = Cacher::new().await?;
+
         let mut auth = AuthManager::new();
         let token = auth.authenticate().await?;
         let credentials = Credentials::with_access_token(&token.access_token);
@@ -72,11 +78,11 @@ impl SpotifyManager {
         );
         let tx = player.get_player_event_channel();
         let this = Arc::new(Self {
+            api: CacheApi::new(AuthCodeSpotify::from_token(token), cacher),
             player_state: Mutex::new(PlayerState {
                 playing: false,
                 paused: false,
             }),
-            api: AuthCodeSpotify::from_token(token),
             session,
             player,
             settings,

@@ -4,15 +4,25 @@ use axum::{
     Router,
     routing::{get, post},
 };
-use futures::channel::mpsc::{Receiver, channel};
+use futures::{
+    channel::mpsc::{Receiver, channel},
+    lock::Mutex,
+};
 pub type Result<T = ()> = anyhow::Result<T>;
 
-use crate::spotify::{Settings, SpotifyManager, SpotifyManagerArc};
+use crate::{
+    data::{PlaylistId, TrackId},
+    queue::Queue,
+    spotify::{Settings, SpotifyManager, SpotifyManagerArc},
+};
 
 mod control;
+mod data;
 mod error;
 mod list;
+mod queue;
 mod spotify;
+mod utils;
 
 #[derive(Clone, Debug)]
 enum PlaybackMessage {
@@ -34,6 +44,7 @@ type App = Arc<AppState>;
 
 struct AppState {
     spotify: SpotifyManagerArc,
+    queue: Queue,
     pending_messages: Receiver<PlayerMessage>,
 }
 
@@ -45,15 +56,16 @@ async fn main() {
         .unwrap();
 
     let app_state = AppState {
+        queue: Queue::new(),
         spotify,
         pending_messages: rx,
     };
     println!("Username: {}", app_state.spotify.session.username());
     let app_state = Arc::new(app_state);
     let app = Router::new()
-        .route("/control/play", post(control::play))
+        .route("/queue/add", post(queue::add))
         .route("/control/toggle-pause", post(control::toggle_pause))
-        .route("/list/playlists/", get(list::list))
+        .route("/list/playlists", get(list::list))
         .route("/list/playlists/{id}", get(list::list))
         .with_state(app_state);
 
