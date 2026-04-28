@@ -13,12 +13,12 @@ use librespot::{
     },
 };
 use rspotify::AuthCodeSpotify;
+use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, mpsc::UnboundedReceiver};
 
-use crate::{
-    PlaybackMessage, PlayerMessage, Result,
-    spotify::cache::{CacheApi, Cacher},
-};
+use crate::{PlaybackMessage, PlayerMessage, Result};
+pub use cache::CacheApi;
+use cache::Cacher;
 
 mod auth;
 mod cache;
@@ -42,9 +42,29 @@ impl Settings {
 }
 
 pub type SpotifyManagerArc = Arc<SpotifyManager>;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PlabackState {
+    Playing {
+        paused: bool,
+    },
+    #[default]
+    Stopped,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Repeat {
+    #[default]
+    No,
+    Single,
+    Playlist,
+}
+
+#[derive(Clone, Serialize, Deserialize, Default)]
 pub struct PlayerState {
-    pub playing: bool,
-    pub paused: bool,
+    pub playback: PlabackState,
+    pub shuffled: bool,
+    pub sorting: Repeat,
 }
 
 pub struct SpotifyManager {
@@ -79,10 +99,7 @@ impl SpotifyManager {
         let tx = player.get_player_event_channel();
         let this = Arc::new(Self {
             api: CacheApi::new(AuthCodeSpotify::from_token(token), cacher),
-            player_state: Mutex::new(PlayerState {
-                playing: false,
-                paused: false,
-            }),
+            player_state: Mutex::new(PlayerState::default()),
             session,
             player,
             settings,
@@ -119,18 +136,12 @@ impl SpotifyManager {
                 use PlaybackMessage::*;
                 let mut player = self.player_state.lock().await;
                 match msg {
-                    Stopped | Unavailable | TrackEnded => {
-                        player.playing = false;
-                        player.paused = false;
-                    }
+                    Stopped | Unavailable | TrackEnded => player.playback = PlabackState::Stopped,
                     Started | Loading { .. } | TrackChanged => {
-                        player.playing = true;
-                        player.paused = false;
+                        player.playback = PlabackState::Playing { paused: false }
                     }
-                    Paused => {
-                        player.playing = true;
-                        player.paused = true;
-                    }
+
+                    Paused => player.playback = PlabackState::Playing { paused: true },
                 }
             }
             tx.send(PlayerMessage::PlaybackMessage(msg)).await.unwrap();

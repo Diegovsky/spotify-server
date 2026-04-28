@@ -32,23 +32,21 @@ struct ErrorJson<'a> {
 
 impl IntoResponse for Error {
     fn into_response(self) -> Response {
-        // let body = serde_json::to_vec(&ErrorJson {
-        //     message: &self.0.to_string(),
-        // })
-        // .unwrap();
-        // let mut resp = Body::from(body).into_response();
-        // resp.headers_mut().insert(
-        //     header::CONTENT_TYPE,
-        //     HeaderValue::from_static("application/json"),
-        // );
-        // resp
         (
             StatusCode::BAD_REQUEST,
             Json(ErrorJson {
                 message: &self.0.to_string(),
-                causes: self.0.chain().map(ToString::to_string).collect(),
+                causes: self.0.chain().skip(1).map(ToString::to_string).collect(),
             }),
         )
             .into_response()
     }
 }
+
+#[macro_export]
+macro_rules! bail {
+    ($($tt:tt)*) => {
+        return Err($crate::error::Error::from(anyhow::anyhow!($($tt)*)))
+    };
+}
+pub use bail;

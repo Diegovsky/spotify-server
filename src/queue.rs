@@ -5,24 +5,41 @@ use futures::lock::Mutex;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    App,
+    App, Result,
     data::{PlaylistId, TrackId},
     error::RouteResult,
+    spotify::{CacheApi, SpotifyManagerArc},
     utils::IdBridge,
 };
 
-#[derive(Default)]
+const CHUNK_SIZE: usize = 8;
+
 pub struct Queue {
+    spotify: SpotifyManagerArc,
     current_playlist: Mutex<Option<PlaylistId>>,
     queue: Mutex<VecDeque<TrackId>>,
 }
 
 impl Queue {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(spotify: SpotifyManagerArc) -> Self {
+        Self {
+            spotify,
+            current_playlist: Default::default(),
+            queue: Default::default(),
+        }
     }
 
-    pub async fn set_playlist(&self, id: PlaylistId, track: Option<TrackId>) {}
+    pub async fn set_playlist(&self, id: PlaylistId, track: Option<TrackId>) -> Result {
+        let tracks = self.spotify.api.get_playlist_songs(id).await?;
+        let tracks = tracks
+            .into_iter()
+            .filter(|i| i.playable)
+            .filter_map(|i| i.id)
+            .collect::<VecDeque<_>>();
+
+        *self.queue.lock().await = tracks;
+        Ok(())
+    }
 
     pub async fn add_track(&self, id: TrackId) {
         let mut queue = self.queue.lock().await;

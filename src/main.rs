@@ -56,7 +56,8 @@ async fn main() {
         .unwrap();
 
     let app_state = AppState {
-        queue: Queue::new(),
+        queue: Queue::new(spotify.clone()),
+
         spotify,
         pending_messages: rx,
     };
